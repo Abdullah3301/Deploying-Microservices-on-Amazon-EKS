@@ -5,55 +5,78 @@ Deployed a containerized WordPress + MySQL application to Amazon EKS with Helm, 
 <img width="3510" height="2218" alt="WordPress on Amazon EKS" src="https://github.com/user-attachments/assets/fa7169f1-3b94-4bec-8949-2b061758cb53" />
 
 
-Overview
+## Overview
 
-This hands-on project takes WordPress from a single server to a Kubernetes cluster on AWS. The cluster runs on three worker nodes in private subnets, the app is packaged as a Helm chart, and an autoscaler adds pods when CPU climbs. A 100-user load test then pushed it past its limits.
+Deployed WordPress on Amazon EKS with three worker nodes in private subnets, a custom Helm chart, an internal MySQL backend, and CPU-based horizontal pod autoscaling.
 
-The original lab guide had several gaps that would have stopped the deployment from working. Fixing them, and diagnosing what happened under load, became the most valuable part of the project.
+The implementation covered infrastructure provisioning, application configuration, restricted external access, and a five-minute load test with 100 concurrent users. Troubleshooting exposed gaps in the original lab guide and demonstrated why successful autoscaling does not necessarily mean a healthy application.
 
-Highlights
+**Key result:** WordPress scaled from **1 to 3 replicas**, but the test recorded only **34.18% availability**. Pod diagnostics confirmed an `OOMKilled` termination, identifying memory pressure as a failure mode that CPU-based scaling alone did not resolve.
 
-Provisioned an EKS cluster (Kubernetes 1.34) with worker nodes in private subnets, built through CloudFormation by eksctl
-Packaged WordPress as a Helm chart and added the MySQL backend the guide was missing, with passwords stored in a Kubernetes Secret
-Restricted the public load balancer to a single allow-listed IP
-Configured a Horizontal Pod Autoscaler that scaled WordPress 1 → 3 pods under load
-Diagnosed failed requests during the load test down to pods being OOMKilled (exit code 137)
-Tech stack
-Area	Tools
-Cloud	Amazon EKS, EC2 (t3.small managed node group), VPC, NAT gateway, Classic Load Balancer, CloudFormation, IAM
-Kubernetes	Deployments, Services, Secrets, Horizontal Pod Autoscaler, metrics-server
-Packaging	Helm 4
-Application	WordPress, MySQL 8.4
-Testing	Siege (HTTP load testing)
-CLI tooling	AWS CLI, eksctl, kubectl, PowerShell on Windows
-Architecture
-Layer	Component	Purpose
-Provisioning	eksctl → CloudFormation	Two stacks: the cluster (VPC, control plane, IAM roles) and the node group
-Control plane	Amazon EKS (AWS-managed)	Kubernetes API and scheduling
-Public subnets	Classic Load Balancer	Public entry point, restricted to one IP (/32)
-Public subnets	NAT gateway	Outbound-only internet access so private nodes can pull images
-Private subnets	3 × t3.small nodes	Run all workloads; no public IP addresses
-Workloads	WordPress pods (Helm release)	The web application, scaled 1–5 replicas by the HPA
-Workloads	MySQL pod + ClusterIP Service	Database, reachable only inside the cluster
-Scaling	metrics-server → HPA	Reads pod CPU every ~15 s and adjusts replica count
-How I built it
-1. Tooling and access
+### Highlights
 
-Installed eksctl and Helm with winget (which verifies installer hashes), and configured the AWS CLI with a dedicated IAM user, not the root account.
+- Provisioned an EKS cluster using `eksctl` and CloudFormation, with managed worker nodes in private subnets.
+- Packaged WordPress with Helm and added the missing MySQL backend.
+- Supplied database credentials through Kubernetes Secrets rather than hard-coding them in manifests.
+- Restricted the public load balancer to a single allow-listed IP address.
+- Configured a Horizontal Pod Autoscaler (HPA) and observed scale-out under load.
+- Investigated failed requests using pod termination states, events, and health probe failures.
 
-2. Created the cluster
-powershell
+## Technology Stack
+
+| Area | Technologies |
+| --- | --- |
+| AWS infrastructure | Amazon EKS, EC2 (`t3.small` managed node group), VPC, NAT gateway, Classic Load Balancer, CloudFormation, IAM |
+| Kubernetes | Kubernetes 1.34, Deployments, Services, Secrets, Horizontal Pod Autoscaler, metrics-server |
+| Application packaging | Helm 4 |
+| Application and database | WordPress, MySQL 8.4 |
+| Load testing | Siege |
+| Tooling | AWS CLI, `eksctl`, `kubectl`, PowerShell on Windows |
+
+## Architecture
+
+Incoming requests reach the public load balancer, which forwards traffic to WordPress pods on private worker nodes. WordPress connects to MySQL through an internal ClusterIP Service. The NAT gateway provides outbound connectivity for private nodes, while metrics-server supplies CPU metrics to the HPA.
+
+| Layer | Component | Purpose |
+| --- | --- | --- |
+| Provisioning | `eksctl` → CloudFormation | Creates the cluster infrastructure and managed node group through separate stacks |
+| Control plane | Amazon EKS | AWS-managed Kubernetes API and scheduling |
+| Public entry point | Classic Load Balancer | Exposes WordPress over HTTP, with access restricted to one IP (`/32`) |
+| Outbound connectivity | NAT gateway | Allows private nodes to reach the internet, including container registries |
+| Compute | 3 × `t3.small` worker nodes | Runs application workloads without public node IP addresses |
+| Web application | WordPress Deployment | Helm-managed workload; HPA configured for 1–5 replicas |
+| Database | MySQL Deployment and ClusterIP Service | Provides database access within the cluster |
+| Autoscaling | metrics-server and HPA | Uses pod CPU utilization to adjust the WordPress replica count |
+
+## Implementation
+
+The snippets below document the key settings and commands. They are excerpts rather than a complete deployable chart; custom values must be connected to the chart templates.
+
+### 1. Configure tooling and AWS access
+
+Installed `eksctl` and Helm using `winget`, then configured the AWS CLI with a dedicated IAM user instead of the root account.
+
+### 2. Provision the EKS cluster
+
+```powershell
 eksctl create cluster --name enterprise-cluster --region us-east-1 `
   --nodegroup-name standard-workers --node-type t3.small `
   --nodes 3 --nodes-min 3 --nodes-max 6 --managed --node-private-networking
+```
 
---node-private-networking keeps the worker nodes off the public internet.
+The `--node-private-networking` option places worker nodes in private subnets without public IP addresses. The node-group bounds are separate from the HPA's pod replica bounds.
 
-3. Built the Helm chart
+### 3. Package WordPress with Helm
 
-Generated a chart with helm create my-microservice and edited values.yaml:
+Generated the chart:
 
-yaml
+```powershell
+helm create my-microservice
+```
+
+Updated `values.yaml` with the application image, restricted load balancer access, resource settings, a liveness probe, and database configuration:
+
+```yaml
 image:
   repository: wordpress
   tag: "latest"
@@ -62,57 +85,90 @@ service:
   type: LoadBalancer
   port: 80
   loadBalancerSourceRanges:
-    - "YOUR-IP/32"          # only this IP can reach the site
+    - "YOUR-IP/32"
 
 resources:
-  requests: { cpu: 300m, memory: 256Mi }
-  limits:   { cpu: 500m, memory: 512Mi }
+  requests:
+    cpu: 300m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
 
 livenessProbe:
-  httpGet: { path: /, port: http }
+  httpGet:
+    path: /
+    port: http
   initialDelaySeconds: 30
-  timeoutSeconds: 5          # default of 1 s killed healthy-but-busy pods
+  timeoutSeconds: 5
 
 env:
   - name: WORDPRESS_DB_HOST
-    value: mysql             # the MySQL Service name
+    value: mysql
+  - name: WORDPRESS_DB_NAME
+    value: wordpress_db
+  - name: WORDPRESS_DB_USER
+    value: wordpress_user
   - name: WORDPRESS_DB_PASSWORD
     valueFrom:
-      secretKeyRef: { name: mysql-secret, key: user-password }
+      secretKeyRef:
+        name: mysql-secret
+        key: user-password
+```
 
-I also edited the chart's deployment.yaml and service.yaml templates so these new env and loadBalancerSourceRanges values are actually rendered.
+Updated `deployment.yaml` and `service.yaml` so the custom environment variables and `loadBalancerSourceRanges` values were rendered into the Kubernetes manifests.
 
-4. Added the database
+The database name and user must match the MySQL configuration below.
 
-Generated random passwords in memory and stored them only in a Kubernetes Secret, so no password was ever written to a file:
+### 4. Configure MySQL and database credentials
 
-powershell
-$rootPw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 24 | % {[char]$_})
-$userPw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 24 | % {[char]$_})
+Generated passwords in memory and created a Kubernetes Secret. Password values were not hard-coded in the manifests.
+
+```powershell
+$rootPw = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+$userPw = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+
 kubectl create secret generic mysql-secret `
-  --from-literal=root-password=$rootPw --from-literal=user-password=$userPw
+  --from-literal=root-password=$rootPw `
+  --from-literal=user-password=$userPw
+```
 
-MySQL runs as its own Deployment with an internal-only Service, and reads its passwords from that Secret:
+MySQL runs in a separate Deployment with an internal ClusterIP Service named `mysql`. The container configuration includes the database, application user, and Secret references:
 
-yaml
+```yaml
 containers:
   - name: mysql
-    image: mysql:8.4                       # pinned version
+    image: mysql:8.4
     env:
       - name: MYSQL_DATABASE
         value: wordpress_db
       - name: MYSQL_USER
         value: wordpress_user
+      - name: MYSQL_ROOT_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: mysql-secret
+            key: root-password
       - name: MYSQL_PASSWORD
         valueFrom:
-          secretKeyRef: { name: mysql-secret, key: user-password }
-5. Deployed and verified
-powershell
+          secretKeyRef:
+            name: mysql-secret
+            key: user-password
+```
+
+### 5. Deploy and verify
+
+```powershell
 helm install my-microservice ./my-microservice
 kubectl get pods
 kubectl get svc my-microservice
-6. Configured autoscaling
-yaml
+```
+
+### 6. Configure horizontal pod autoscaling
+
+With metrics-server available, configured the HPA to target the actual WordPress Deployment, `my-microservice`, rather than the incorrect `wordpress` name in the original guide.
+
+```yaml
 apiVersion: autoscaling/v1
 kind: HorizontalPodAutoscaler
 metadata:
@@ -121,68 +177,92 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: my-microservice      # the guide said "wordpress", which doesn't exist
+    name: my-microservice
   minReplicas: 1
   maxReplicas: 5
   targetCPUUtilizationPercentage: 50
-7. Load tested
+```
 
-Ran Siege inside the cluster against the internal Service name, since the public load balancer only accepts one IP:
+### 7. Run the load test
 
-powershell
+Ran Siege inside the cluster against the WordPress Service, avoiding the public load balancer's single-IP access restriction:
+
+```powershell
 kubectl run siege --image=jstarcher/siege --restart=Never --command -- `
   /bin/sh -c "siege -c 100 -t 5m http://my-microservice/"
-Gaps I fixed in the original guide
-Problem in the guide	What I did
-WordPress deployed with no database	Added a MySQL Deployment, an internal Service, and a Secret for credentials
-Load balancer open to the whole internet	Added loadBalancerSourceRanges to allow one IP only
-Worker nodes given public IPs	Used --node-private-networking
-HPA targeted a Deployment named wordpress, which doesn't exist	Pointed it at my-microservice
-Siege targeted the external address, which the IP allow-list blocks	Targeted the in-cluster Service name instead
-Health checks timed out after 1 second	Raised to 5 seconds so busy pods aren't restarted
-t3.medium nodes, not allowed on the AWS Free plan	Switched to t3.small
-Commands written for Git Bash, and kubectl never installed	Adapted everything to PowerShell
-Troubleshooting
-1. Cluster created, but no worker nodes
-Symptom: eksctl timed out after ~25 minutes; the console showed the cluster Active with 0 nodes.
-Diagnosis: The node group was stuck in CREATING with no health issues, then rolled back. Its CloudFormation events held the reason.
-Root cause: InvalidParameterCombination: The specified instance type is not eligible for Free Tier.
-Fix: Deleted the partial cluster with eksctl (so the VPC and NAT gateway were removed too) and recreated it with t3.small.
-2. Autoscaling worked, but most requests failed
+```
 
-HPA behaviour during the test
+## Load Test Results
 
-Time	CPU (vs. 50% target)	Replicas	What happened
-Before	5–6%	1	Idle
-+15 s	55%	1	Within the HPA's 10% tolerance, so no action
-+60 s	111%	1	Overloaded
-+75 s	14%	3	Scaled out: ⌈1 × 111 / 50⌉ = 3
+**Test conditions:** five minutes, 100 concurrent users, with requests sent from inside the cluster.
 
-Siege results (5 minutes, 100 concurrent users)
+### Observed HPA behavior
 
-Metric	Result
-Successful transactions	242
-Failed transactions	466
-Availability	34.18%
-Average response time	7.39 s
-Longest transaction	30.90 s
+CPU utilization below is relative to the configured CPU request, with an HPA target of 50%. Times are approximate observations.
 
-Diagnosis
+| Time | CPU utilization | Replicas | Observation |
+| --- | --- | --- | --- |
+| Before test | 5–6% | 1 | Idle baseline |
+| +15 seconds | 55% | 1 | No scaling observed near the tolerance boundary |
+| +60 seconds | 111% | 1 | CPU utilization exceeded the target |
+| +75 seconds | 14% | 3 | Scale-out observed; CPU utilization subsequently fell |
 
-CPU stayed low after scaling, yet requests were timing out, so CPU wasn't the bottleneck. That's also why the HPA stopped at 3 pods.
-kubectl describe pod on the original pod showed:
-  Last State:  Terminated
-    Reason:    OOMKilled
-    Exit Code: 137
-Its events showed liveness and readiness probes timing out before the kill, then connection refused while it restarted.
+At 111% utilization, the simplified scaling calculation gives `ceil(1 × 111 / 50) = 3` replicas, consistent with the observed scale-out.
 
-Root cause: WordPress's Apache server starts a separate worker process per concurrent visitor. With 100 visitors arriving at once, memory hit the pod's 512 Mi limit and the container was killed.
+### Siege results
 
-Lessons
+| Metric | Result |
+| --- | ---: |
+| Successful transactions | 242 |
+| Failed transactions | 466 |
+| Availability reported by Siege | **34.18%** |
+| Average response time | 7.39 seconds |
+| Longest transaction | 30.90 seconds |
 
-Autoscaling only reacts to the metric it watches. A memory-bound app needs memory limits sized from load tests, or bounded worker counts.
-Liveness probes should catch frozen apps, not busy ones. Strict liveness settings restart pods exactly when they're needed most.
-Next fix: cap Apache's workers per pod (e.g., MaxRequestWorkers) so extra requests queue instead of crashing the pod. That makes CPU the bottleneck, which the HPA can act on.
+The HPA increased the replica count, but request success remained low. Scaling activity alone was insufficient to demonstrate application reliability under this load.
+
+## Troubleshooting
+
+### 1. Cluster active, but no worker nodes
+
+| Item | Finding |
+| --- | --- |
+| Symptom | `eksctl` timed out after approximately 25 minutes; EKS showed an active cluster with zero nodes |
+| Investigation | The node group remained in `CREATING`, then rolled back; CloudFormation events exposed the failure |
+| Error | `InvalidParameterCombination: The specified instance type is not eligible for Free Tier.` |
+| Resolution | Deleted the partial cluster with `eksctl` and recreated it using `t3.small` |
+
+### 2. Autoscaling succeeded, but requests failed
+
+After scale-out, CPU utilization fell while requests continued to time out. Inspection of the original WordPress pod showed:
+
+```text
+Last State:  Terminated
+Reason:      OOMKilled
+Exit Code:   137
+```
+
+Pod events also showed liveness and readiness probe timeouts, followed by `connection refused` while the container restarted.
+
+**Confirmed finding:** a WordPress container was killed for exceeding its available memory. Its configured memory limit was `512Mi`.
+
+**Likely contributing factor:** concurrent Apache request handling increased memory demand during the 100-user test. The evidence supports memory pressure as a failure mode, but does not establish that it caused every failed transaction.
+
+## Lessons Learned
+
+- **Choose scaling signals that match the workload.** CPU-based autoscaling did not directly respond to the observed memory pressure.
+- **Size resources from load-test evidence.** Memory limits and application concurrency settings need to be evaluated together.
+- **Tune health probes under load.** Probe timeouts can cause additional restarts when an application is busy or recovering.
+- **Verify chart templates and resource names.** Custom values only take effect when templates render them, and an HPA must target the correct Deployment.
+- **Measure user-facing results.** Replica count, transaction success, response time, and pod health all contribute to assessing reliability.
+
+### Next Steps
+
+Tune Apache concurrency, including `MaxRequestWorkers`, review memory sizing and probe settings, and repeat the same load test.
+
+Compare request success, latency, and restart counts before claiming an improvement. These changes have not yet been validated by a repeat test.
+
+
 Screenshots
 
 Cluster overview: Active, Kubernetes 1.34, 3 nodes, 0 health issues 
